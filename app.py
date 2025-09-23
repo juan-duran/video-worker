@@ -50,4 +50,4 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
     secure_url = j.get("secure_url")
     thumb_url  = f"https://res.cloudinary.com/{CLD_NAME}/video/upload/so_2,w_640,h_360,c_fill,q_auto,f_auto/{public_id}.jpg"
 
-    return {"reddit_id": rid, "public_id": public_id, "secure_url": secure_url, "thumb_url": thumb_url}
+    return {"reddit_id": rid, "source_url": vredd, "public_id": public_id, "secure_url": secure_url, "thumb_url": thumb_url}
