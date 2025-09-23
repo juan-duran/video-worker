@@ -1,128 +1,184 @@
-# app.py — stable rollback (no cloud deps, no 500s)
-import os, json, time, subprocess
-from pathlib import Path
-from typing import Optional, Dict, Any
-from fastapi import FastAPI, Header, Query
-from pydantic import BaseModel
+import os, tempfile, subprocess, uuid, json, time, shlex, requests
+from fastapi import FastAPI, Body, Header, HTTPException
+from fastapi.responses import PlainTextResponse
 
-WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
-MAX_SECONDS = int(os.environ.get("MAX_SECONDS", "240"))       # 0 = ignore
-MAX_MEGABYTES = int(os.environ.get("MAX_MEGABYTES", "120"))  # 0 = ignore
-PORT = int(os.environ.get("PORT", "10000"))
+# ---------- ENV ----------
+CLD_NAME        = os.environ["CLD_NAME"]                 # ex: drfh6p8cn
+CLD_PRESET      = os.environ["CLD_UNSIGNED_PRESET"]      # ex: brian_vid_unsigned
+WORKER_TOKEN    = os.environ.get("WORKER_TOKEN", "")
+MAX_DURATION_S  = int(os.environ.get("MAX_DURATION_SEC", "240"))  # hard stop (e.g. 240s = 4 min)
+MAX_BYTES       = int(os.environ.get("MAX_BYTES", "0"))  # optional hard stop by size (0 = ignore)
 
-TMP = Path("/tmp"); TMP.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title="video-worker")
+# yt-dlp politeness/retry tuning to reduce 429s
+YTDLP_COMMON = [
+    "--no-progress",
+    "--retries", "10",
+    "--fragment-retries", "10",
+    "--retry-sleep", "linear=1:10",
+    "--sleep-requests", "1",
+    "--concurrent-fragments", "1",
+    "--user-agent", "Mozilla/5.0 (compatible; IDBVideoWorker/1.0)",
+]
 
-class Req(BaseModel):
-    reddit_id: str
-    vredd_url: Optional[str] = None
-    video_url: Optional[str] = None
+app = FastAPI()
 
-def ok(d: Dict[str, Any]): return {"status": "ok", **d}
-def skip(reason: str, **kw): return {"status": "skipped", "reason": reason, **kw}
-def err(reason: str, **kw): return {"status": "error", "reason": reason, **kw}
+# ---------- health/roots ----------
+@app.get("/ping")
+def ping():
+    return {"ok": True}
 
-def run_out(cmd: list[str], timeout: int) -> str:
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       check=True, timeout=timeout)
-    return p.stdout.decode("utf-8", "replace")
-
-def probe(url: str) -> Dict[str, Any]:
-    try:
-        meta = json.loads(run_out(["yt-dlp","-j","--skip-download",url], timeout=45))
-        dur = int(float(meta.get("duration") or 0))
-        approx = int(float(meta.get("filesize_approx") or 0))
-        return {"duration": dur, "approx_mb": approx//(1024*1024) if approx else 0}
-    except Exception as e:
-        return {"probe_error": str(e)[:300]}
-
-def download(reddit_id: str, url: str) -> Path:
-    dest = TMP / f"{reddit_id}.mp4"
-    cmd = [
-        "yt-dlp","-q","--no-progress",
-        "-N","2","--retries","3","--fragment-retries","10","--sleep-requests","5",
-        "-o", str(dest), "-f","bv*+ba/b","--merge-output-format","mp4", url
-    ]
-    last = None
-    for delay in (5, 10, 20, 40):
-        try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.STDOUT, timeout=900)
-            if dest.exists() and dest.stat().st_size > 0:
-                return dest
-            raise RuntimeError("empty file")
-        except Exception as e:
-            last = e
-            try: dest.unlink(missing_ok=True)
-            except: pass
-            time.sleep(delay)
-    raise last or RuntimeError("download failed")
-
-@app.on_event("startup")
-def clean_tmp():
-    for g in ("*.mp4","*.part","*.webm","*.m4a","*.ytdl"):
-        for p in TMP.glob(g):
-            try: p.unlink()
-            except: pass
-
-@app.get("/")
-def root(): return {"ok": True, "service": "video-worker"}
 @app.get("/health")
 def health():
+    return {"ok": True}
+
+@app.get("/", response_class=PlainTextResponse)
+@app.head("/", response_class=PlainTextResponse)
+def root():
+    return "ok"
+
+# ---------- helpers ----------
+def _run(cmd: list[str], check=True, capture=False, text=False, timeout=None):
+    return subprocess.run(
+        cmd, check=check,
+        stdout=(subprocess.PIPE if capture else None),
+        stderr=(subprocess.PIPE if capture else None),
+        text=text, timeout=timeout
+    )
+
+def _preflight_info(url: str, retries: int = 5, backoff_base: float = 1.0) -> dict:
+    """
+    Use yt-dlp to fetch metadata only (no download). Returns {} on failure.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            cmd = ["yt-dlp", *YTDLP_COMMON, "-j", "--skip-download", url]
+            p = _run(cmd, check=True, capture=True, text=True, timeout=60)
+            # yt-dlp may print multiple lines; take the first valid JSON line
+            for line in p.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+        except subprocess.CalledProcessError:
+            pass
+        # backoff
+        time.sleep(backoff_base * attempt)
+    return {}
+
+def _ffprobe_duration(path: str) -> float | None:
+    try:
+        p = _run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "format=duration", "-of", "json", path],
+            check=True, capture=True, text=True, timeout=30
+        )
+        j = json.loads(p.stdout)
+        dur = float(j.get("format", {}).get("duration", "0") or 0)
+        return dur if dur > 0 else None
+    except Exception:
+        return None
+
+def _stable_response(reddit_id: str, source_url: str, public_id=None, secure_url=None, thumb_url=None):
+    """
+    EXACT output shape your nodes expect. Keys always present.
+    """
     return {
-        "ok": True,
-        "limits": {"max_seconds": MAX_SECONDS, "max_megabytes": MAX_MEGABYTES},
-        "version": os.environ.get("GIT_COMMIT","dev"),
+        "reddit_id": reddit_id,
+        "source_url": source_url,
+        "public_id": public_id,
+        "secure_url": secure_url,
+        "thumb_url":  thumb_url,
     }
 
+# ---------- main endpoint ----------
 @app.post("/mux-upload")
-def mux_upload(body: Req, x_token: Optional[str] = Header(default=None, alias="X-Token"),
-               allow_long: int = Query(0)):
+def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
+    # Auth
+    if WORKER_TOKEN and x_token != WORKER_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid token")
+
+    vredd = (payload.get("vredd_url") or "").strip()
+    rid   = (payload.get("reddit_id") or str(uuid.uuid4())).strip()
+    if not vredd.startswith("https://v.redd.it/"):
+        raise HTTPException(status_code=400, detail="vredd_url inválida")
+
+    # ---------- preflight: skip long videos BEFORE download ----------
+    info = _preflight_info(vredd)
+    dur  = None
     try:
-        if not (body.reddit_id and (body.vredd_url or body.video_url)):
-            return err("bad_request", message="missing reddit_id or url")
-        if not WORKER_TOKEN:
-            return err("server_misconfigured", message="WORKER_TOKEN not set")
-        if x_token != WORKER_TOKEN:
-            return err("unauthorized", message="bad token")
+        # yt-dlp duration is seconds (float)
+        if "duration" in info and info["duration"]:
+            dur = float(info["duration"])
+    except Exception:
+        dur = None
 
-        url = (body.vredd_url or body.video_url).strip()
-        rid = body.reddit_id.strip()
+    if dur is not None and MAX_DURATION_S > 0 and dur > MAX_DURATION_S:
+        # Skip cleanly with stable shape (null urls)
+        return _stable_response(rid, vredd, public_id=None, secure_url=None, thumb_url=None)
 
-        pr = probe(url)
-        dur = int(pr.get("duration") or 0)
-        approx_mb = int(pr.get("approx_mb") or 0)
-        if not allow_long and (
-            (MAX_SECONDS and dur and dur > MAX_SECONDS) or
-            (MAX_MEGABYTES and approx_mb and approx_mb > MAX_MEGABYTES)
-        ):
-            return skip("duration_or_size_limit",
-                        reddit_id=rid, url=url,
-                        duration_sec=dur, limit_sec=MAX_SECONDS,
-                        approx_mb=approx_mb, limit_mb=MAX_MEGABYTES)
+    # ---------- download (cap at 720p mp4 like your original) ----------
+    out_path = os.path.join(tempfile.gettempdir(), f"{rid}.mp4")
+    dl_cmd = [
+        "yt-dlp",
+        *YTDLP_COMMON,
+        "-f", "bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "-S", "res:720,ext:mp4",
+        "-o", out_path,
+        vredd,
+    ]
+    try:
+        _run(dl_cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"yt-dlp/ffmpeg erro: {e}")
 
-        try:
-            path = download(rid, url)
-        except Exception as e:
-            return err("download_failed", reddit_id=rid, message=str(e)[:500], probe_error=pr.get("probe_error"))
+    # Optional: hard-stop by bytes if configured
+    try:
+        file_bytes = os.path.getsize(out_path)
+        if MAX_BYTES > 0 and file_bytes > MAX_BYTES:
+            try: os.remove(out_path)
+            except Exception: pass
+            return _stable_response(rid, vredd, public_id=None, secure_url=None, thumb_url=None)
+    except Exception:
+        pass
 
-        size = path.stat().st_size
-        mb = round(size/1024/1024, 2)
-        # We’re not uploading anywhere in this rollback. Return metadata so your flow can continue.
-        res = ok({
-            "reddit_id": rid,
-            "local_path": str(path),
-            "bytes": size,
-            "mb": mb,
-            "duration_sec": dur or None,
-            "approx_mb_probe": approx_mb or None
-        })
-        try: path.unlink(missing_ok=True)
-        except: pass
-        return res
-    except Exception as e:
-        return err("unexpected", message=str(e)[:500])
+    # Double-check duration if preflight failed
+    if dur is None:
+        dur = _ffprobe_duration(out_path)
+        if dur is not None and MAX_DURATION_S > 0 and dur > MAX_DURATION_S:
+            try: os.remove(out_path)
+            except Exception: pass
+            return _stable_response(rid, vredd, public_id=None, secure_url=None, thumb_url=None)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=PORT)
+    # ---------- unsigned upload to Cloudinary via REST (no SDK) ----------
+    # NOTE: This keeps your original, working approach.
+    up_url = f"https://api.cloudinary.com/v1_1/{CLD_NAME}/video/upload"
+    public_id = f"reddit/{rid}"
+
+    try:
+        with open(out_path, "rb") as f:
+            res = requests.post(
+                up_url,
+                data={"upload_preset": CLD_PRESET, "public_id": public_id},
+                files={"file": f},
+                timeout=600
+            )
+    finally:
+        # best effort cleanup
+        try: os.remove(out_path)
+        except Exception: pass
+
+    if res.status_code >= 300:
+        # On upload error, still return stable shape with null urls
+        # (so the flow can "continue on error" and not explode)
+        return _stable_response(rid, vredd, public_id=None, secure_url=None, thumb_url=None)
+
+    j = res.json()
+    public_id  = j.get("public_id")
+    secure_url = j.get("secure_url")
+    thumb_url  = f"https://res.cloudinary.com/{CLD_NAME}/video/upload/so_2,w_640,h_360,c_fill,q_auto,f_auto/{public_id}.jpg" if public_id else None
+
+    return _stable_response(rid, vredd, public_id=public_id, secure_url=secure_url, thumb_url=thumb_url)
