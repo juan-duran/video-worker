@@ -1,4 +1,4 @@
-fastapi
-uvicorn[standard]
-yt-dlp
-requests
+fastapi>=0.110
+uvicorn[standard]>=0.24
+yt-dlp>=2024.8.6
+cloudinary>=1.41.0
