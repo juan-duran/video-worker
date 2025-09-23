@@ -1,8 +1,8 @@
 import os, tempfile, subprocess, uuid, requests
 from fastapi import FastAPI, Body, Header, HTTPException
 
-CLD_NAME = os.environ["CLD_NAME"]                # ex: drfh6p8cn
-CLD_PRESET = os.environ["CLD_UNSIGNED_PRESET"]   # ex: brian_vid_unsigned
+CLD_NAME   = os.environ["CLD_NAME"]                 # ex: drfh6p8cn
+CLD_PRESET = os.environ["CLD_UNSIGNED_PRESET"]      # ex: brian_vid_unsigned
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN","")
 
 app = FastAPI()
@@ -22,10 +22,15 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
         raise HTTPException(status_code=400, detail="vredd_url inválida")
 
     out_path = os.path.join(tempfile.gettempdir(), f"{rid}.mp4")
-    cmd = ["yt-dlp","-f","bv*+ba/b","--merge-output-format","mp4",
-           "-S","res:720,ext:mp4","-o",out_path, vredd]
+    cmd = [
+        "yt-dlp", "-f", "bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "-S", "res:720,ext:mp4",
+        "-o", out_path, vredd
+    ]
     try:
-        subprocess.check.call(cmd)
+        # 👇 correção aqui
+        subprocess.check_call(cmd)
     except subprocess.CalledProcessError as e:
         raise HTTPException(status_code=500, detail=f"yt-dlp/ffmpeg erro: {e}")
 
@@ -35,7 +40,7 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
             up_url,
             data={"upload_preset": CLD_PRESET, "public_id": f"reddit/{rid}"},
             files={"file": f},
-            timeout=120
+            timeout=180
         )
     if res.status_code >= 300:
         raise HTTPException(status_code=500, detail=f"cloudinary: {res.text}")
