@@ -1,4 +1,4 @@
-import os, tempfile, subprocess, uuid, json, time, shlex, requests
+import os, tempfile, subprocess, uuid, json, time, requests
 from fastapi import FastAPI, Body, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 
@@ -6,8 +6,8 @@ from fastapi.responses import PlainTextResponse
 CLD_NAME        = os.environ["CLD_NAME"]                 # ex: drfh6p8cn
 CLD_PRESET      = os.environ["CLD_UNSIGNED_PRESET"]      # ex: brian_vid_unsigned
 WORKER_TOKEN    = os.environ.get("WORKER_TOKEN", "")
-MAX_DURATION_S  = int(os.environ.get("MAX_DURATION_SEC", "240"))  # hard stop (e.g. 240s = 4 min)
-MAX_BYTES       = int(os.environ.get("MAX_BYTES", "0"))  # optional hard stop by size (0 = ignore)
+MAX_DURATION_S  = int(os.environ.get("MAX_DURATION_SEC", "240"))  # e.g. 240s = 4 min
+MAX_BYTES       = int(os.environ.get("MAX_BYTES", "0"))           # 0 = ignore
 
 # yt-dlp politeness/retry tuning to reduce 429s
 YTDLP_COMMON = [
@@ -46,14 +46,11 @@ def _run(cmd: list[str], check=True, capture=False, text=False, timeout=None):
     )
 
 def _preflight_info(url: str, retries: int = 5, backoff_base: float = 1.0) -> dict:
-    """
-    Use yt-dlp to fetch metadata only (no download). Returns {} on failure.
-    """
+    """Use yt-dlp to fetch metadata only (no download). Returns {} on failure."""
     for attempt in range(1, retries + 1):
         try:
             cmd = ["yt-dlp", *YTDLP_COMMON, "-j", "--skip-download", url]
             p = _run(cmd, check=True, capture=True, text=True, timeout=60)
-            # yt-dlp may print multiple lines; take the first valid JSON line
             for line in p.stdout.splitlines():
                 line = line.strip()
                 if not line:
@@ -64,8 +61,7 @@ def _preflight_info(url: str, retries: int = 5, backoff_base: float = 1.0) -> di
                     continue
         except subprocess.CalledProcessError:
             pass
-        # backoff
-        time.sleep(backoff_base * attempt)
+        time.sleep(backoff_base * attempt)  # backoff
     return {}
 
 def _ffprobe_duration(path: str) -> float | None:
@@ -81,27 +77,22 @@ def _ffprobe_duration(path: str) -> float | None:
     except Exception:
         return None
 
-def _stable_response(reddit_id: str, source_url: str, public_id=None, secure_url=None, thumb_url=None):
+def _stable_response(reddit_id: str, source_url: str,
+                     public_id=None, secure_url=None, thumb_url=None, error: str | None = None):
     """
-    EXACT output shape your nodes expect. Keys always present on success.
+    EXACT output shape your nodes expect. Success keys unchanged.
+    Adds `error` ONLY when not None (for Mark Error node).
     """
-    return {
+    out = {
         "reddit_id": reddit_id,
         "source_url": source_url,
         "public_id": public_id,
         "secure_url": secure_url,
         "thumb_url":  thumb_url,
     }
-
-def _error_payload(reddit_id: str, source_url: str, message: str):
-    """
-    Enriched error/skip payload: keep the known keys with nulls,
-    and add fields your Mark Error node expects.
-    """
-    base = _stable_response(reddit_id, source_url, None, None, None)
-    base["video_url_clean"] = source_url
-    base["error"] = {"message": message}
-    return base
+    if error:
+        out["error"] = error
+    return out
 
 # ---------- main endpoint ----------
 @app.post("/mux-upload")
@@ -110,7 +101,7 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
     if WORKER_TOKEN and x_token != WORKER_TOKEN:
         raise HTTPException(status_code=401, detail="invalid token")
 
-    vredd = (payload.get("vredd_url") or "").strip()
+    vredd = (payload.get("vredd_url") or payload.get("video_url") or "").strip()
     rid   = (payload.get("reddit_id") or str(uuid.uuid4())).strip()
     if not vredd.startswith("https://v.redd.it/"):
         raise HTTPException(status_code=400, detail="vredd_url inválida")
@@ -119,17 +110,18 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
     info = _preflight_info(vredd)
     dur  = None
     try:
-        # yt-dlp duration is seconds (float)
         if "duration" in info and info["duration"]:
             dur = float(info["duration"])
     except Exception:
         dur = None
 
     if dur is not None and MAX_DURATION_S > 0 and dur > MAX_DURATION_S:
-        # Skip cleanly with error payload so DB can record it
-        return _error_payload(rid, vredd, f"skipped_long_video: {int(dur)}s > {MAX_DURATION_S}s")
+        # Skip cleanly with stable shape (null urls) and an error note
+        return _stable_response(
+            rid, vredd, error=f"skipped_long:{int(dur)}s>max{MAX_DURATION_S}s"
+        )
 
-    # ---------- download (cap at 720p mp4 like your original) ----------
+    # ---------- download (cap at 720p mp4 like original) ----------
     out_path = os.path.join(tempfile.gettempdir(), f"{rid}.mp4")
     dl_cmd = [
         "yt-dlp",
@@ -140,11 +132,13 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
         "-o", out_path,
         vredd,
     ]
-    try:
-        _run(dl_cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        # Return error payload so the flow can mark error without exploding
-        return _error_payload(rid, vredd, f"yt-dlp_error: {e}")
+
+    # Run WITHOUT throwing, capture stderr for diagnostics
+    p = _run(dl_cmd, check=False, capture=True, text=True)
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout or "").strip()
+        # Graceful failure -> stable shape + error string
+        return _stable_response(rid, vredd, error=f"yt-dlp_error: {err[:500]}")
 
     # Optional: hard-stop by bytes if configured
     try:
@@ -152,7 +146,9 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
         if MAX_BYTES > 0 and file_bytes > MAX_BYTES:
             try: os.remove(out_path)
             except Exception: pass
-            return _error_payload(rid, vredd, f"skipped_large_file: {file_bytes}B > {MAX_BYTES}B")
+            return _stable_response(
+                rid, vredd, error=f"skipped_size:{file_bytes}>max{MAX_BYTES}"
+            )
     except Exception:
         pass
 
@@ -162,10 +158,11 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
         if dur is not None and MAX_DURATION_S > 0 and dur > MAX_DURATION_S:
             try: os.remove(out_path)
             except Exception: pass
-            return _error_payload(rid, vredd, f"skipped_long_video_after_probe: {int(dur)}s > {MAX_DURATION_S}s")
+            return _stable_response(
+                rid, vredd, error=f"skipped_long:{int(dur)}s>max{MAX_DURATION_S}s"
+            )
 
     # ---------- unsigned upload to Cloudinary via REST (no SDK) ----------
-    # NOTE: This keeps your original, working approach.
     up_url = f"https://api.cloudinary.com/v1_1/{CLD_NAME}/video/upload"
     public_id = f"reddit/{rid}"
 
@@ -178,22 +175,20 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
                 timeout=600
             )
     finally:
-        # best effort cleanup
         try: os.remove(out_path)
         except Exception: pass
 
     if res.status_code >= 300:
-        # Return enriched error so DB can capture last_error
-        snippet = ""
-        try:
-            snippet = res.text[:200]
-        except Exception:
-            pass
-        return _error_payload(rid, vredd, f"cloudinary_error: {res.status_code} {snippet}")
+        # Continue on error so workflow does not explode
+        txt = res.text.strip()[:500]
+        return _stable_response(rid, vredd, error=f"cloudinary_error:{res.status_code}:{txt}")
 
     j = res.json()
     public_id  = j.get("public_id")
     secure_url = j.get("secure_url")
-    thumb_url  = f"https://res.cloudinary.com/{CLD_NAME}/video/upload/so_2,w_640,h_360,c_fill,q_auto,f_auto/{public_id}.jpg" if public_id else None
+    thumb_url  = (
+        f"https://res.cloudinary.com/{CLD_NAME}/video/upload/so_2,w_640,h_360,c_fill,q_auto,f_auto/{public_id}.jpg"
+        if public_id else None
+    )
 
     return _stable_response(rid, vredd, public_id=public_id, secure_url=secure_url, thumb_url=thumb_url)
