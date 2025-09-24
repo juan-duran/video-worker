@@ -45,14 +45,16 @@ def _run(cmd: list[str], check=True, capture=False, text=False, timeout=None):
         text=text, timeout=timeout
     )
 
-def _preflight_info(url: str, retries: int = 5, backoff_base: float = 1.0) -> dict:
+def _preflight_info(url: str, retries: int = 1, backoff_base: float = 1.0) -> dict:
     """
     Use yt-dlp to fetch metadata only (no download). Returns {} on failure.
+    (Quick check: 1 try, short timeout)
     """
     for attempt in range(1, retries + 1):
         try:
             cmd = ["yt-dlp", *YTDLP_COMMON, "-j", "--skip-download", url]
-            p = _run(cmd, check=True, capture=True, text=True, timeout=60)
+            # short timeout for preflight
+            p = _run(cmd, check=True, capture=True, text=True, timeout=10)
             # yt-dlp may print multiple lines; take the first valid JSON line
             for line in p.stdout.splitlines():
                 line = line.strip()
@@ -64,7 +66,7 @@ def _preflight_info(url: str, retries: int = 5, backoff_base: float = 1.0) -> di
                     continue
         except subprocess.CalledProcessError:
             pass
-        # backoff
+        # backoff (won't run if retries==1)
         time.sleep(backoff_base * attempt)
     return {}
 
@@ -115,11 +117,16 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
     if not vredd.startswith("https://v.redd.it/"):
         raise HTTPException(status_code=400, detail="vredd_url inválida")
 
-    # ---------- preflight: skip long videos BEFORE download ----------
+    # ---------- preflight: quick check & skip if no media ----------
     info = _preflight_info(vredd)
-    dur  = None
+    # early bail if yt-dlp reports no usable media (deleted/removed)
+    has_media = bool(info.get("duration") or info.get("formats") or info.get("url"))
+    if not info or not has_media:
+        return _error_payload(rid, vredd, "unavailable_or_removed_preflight")
+
+    # length guard (if duration present)
+    dur = None
     try:
-        # yt-dlp duration is seconds (float)
         if "duration" in info and info["duration"]:
             dur = float(info["duration"])
     except Exception:
