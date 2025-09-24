@@ -83,7 +83,7 @@ def _ffprobe_duration(path: str) -> float | None:
 
 def _stable_response(reddit_id: str, source_url: str, public_id=None, secure_url=None, thumb_url=None):
     """
-    EXACT output shape your nodes expect. Keys always present on success.
+    EXACT output shape your nodes expect. Keys always present.
     """
     return {
         "reddit_id": reddit_id,
@@ -92,16 +92,6 @@ def _stable_response(reddit_id: str, source_url: str, public_id=None, secure_url
         "secure_url": secure_url,
         "thumb_url":  thumb_url,
     }
-
-def _error_payload(reddit_id: str, source_url: str, message: str):
-    """
-    Enriched error/skip payload: keep the known keys with nulls,
-    and add fields your Mark Error node expects.
-    """
-    base = _stable_response(reddit_id, source_url, None, None, None)
-    base["video_url_clean"] = source_url
-    base["error"] = {"message": message}
-    return base
 
 # ---------- main endpoint ----------
 @app.post("/mux-upload")
@@ -126,8 +116,8 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
         dur = None
 
     if dur is not None and MAX_DURATION_S > 0 and dur > MAX_DURATION_S:
-        # Skip cleanly with error payload so DB can record it
-        return _error_payload(rid, vredd, f"skipped_long_video: {int(dur)}s > {MAX_DURATION_S}s")
+        # Skip cleanly with stable shape (null urls)
+        return _stable_response(rid, vredd, public_id=None, secure_url=None, thumb_url=None)
 
     # ---------- download (cap at 720p mp4 like your original) ----------
     out_path = os.path.join(tempfile.gettempdir(), f"{rid}.mp4")
@@ -143,8 +133,7 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
     try:
         _run(dl_cmd, check=True)
     except subprocess.CalledProcessError as e:
-        # Return error payload so the flow can mark error without exploding
-        return _error_payload(rid, vredd, f"yt-dlp_error: {e}")
+        raise HTTPException(status_code=500, detail=f"yt-dlp/ffmpeg erro: {e}")
 
     # Optional: hard-stop by bytes if configured
     try:
@@ -152,7 +141,7 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
         if MAX_BYTES > 0 and file_bytes > MAX_BYTES:
             try: os.remove(out_path)
             except Exception: pass
-            return _error_payload(rid, vredd, f"skipped_large_file: {file_bytes}B > {MAX_BYTES}B")
+            return _stable_response(rid, vredd, public_id=None, secure_url=None, thumb_url=None)
     except Exception:
         pass
 
@@ -162,7 +151,7 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
         if dur is not None and MAX_DURATION_S > 0 and dur > MAX_DURATION_S:
             try: os.remove(out_path)
             except Exception: pass
-            return _error_payload(rid, vredd, f"skipped_long_video_after_probe: {int(dur)}s > {MAX_DURATION_S}s")
+            return _stable_response(rid, vredd, public_id=None, secure_url=None, thumb_url=None)
 
     # ---------- unsigned upload to Cloudinary via REST (no SDK) ----------
     # NOTE: This keeps your original, working approach.
@@ -183,13 +172,9 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
         except Exception: pass
 
     if res.status_code >= 300:
-        # Return enriched error so DB can capture last_error
-        snippet = ""
-        try:
-            snippet = res.text[:200]
-        except Exception:
-            pass
-        return _error_payload(rid, vredd, f"cloudinary_error: {res.status_code} {snippet}")
+        # On upload error, still return stable shape with null urls
+        # (so the flow can "continue on error" and not explode)
+        return _stable_response(rid, vredd, public_id=None, secure_url=None, thumb_url=None)
 
     j = res.json()
     public_id  = j.get("public_id")
