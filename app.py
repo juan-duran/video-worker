@@ -163,16 +163,14 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
     except Exception:
         pass
 
-    # Double-check duration if preflight failed
-    if dur is None:
-        dur = _ffprobe_duration(out_path)
-        if dur is not None and MAX_DURATION_S > 0 and dur > MAX_DURATION_S:
-            try: os.remove(out_path)
-            except Exception: pass
-            return _error_payload(rid, vredd, f"skipped_long_video_after_probe: {int(dur)}s > {MAX_DURATION_S}s")
+    # ---------- ALWAYS verify duration after download (trust but verify) ----------
+    post_dur = _ffprobe_duration(out_path)
+    if post_dur is not None and MAX_DURATION_S > 0 and post_dur > MAX_DURATION_S:
+        try: os.remove(out_path)
+        except Exception: pass
+        return _error_payload(rid, vredd, f"skipped_long_video_after_download: {int(post_dur)}s > {MAX_DURATION_S}s")
 
     # ---------- unsigned upload to Cloudinary via REST (no SDK) ----------
-    # NOTE: This keeps your original, working approach.
     up_url = f"https://api.cloudinary.com/v1_1/{CLD_NAME}/video/upload"
     public_id = f"reddit/{rid}"
 
@@ -184,6 +182,9 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
                 files={"file": f},
                 timeout=600
             )
+    except requests.exceptions.RequestException as e:
+        # network/timeout/etc — return a structured error instead of 500
+        return _error_payload(rid, vredd, f"cloudinary_exception: {type(e).__name__}: {e}")
     finally:
         # best effort cleanup
         try: os.remove(out_path)
