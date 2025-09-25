@@ -6,7 +6,7 @@ from fastapi.responses import PlainTextResponse
 CLD_NAME        = os.environ["CLD_NAME"]                 # ex: drfh6p8cn
 CLD_PRESET      = os.environ["CLD_UNSIGNED_PRESET"]      # ex: brian_vid_unsigned
 WORKER_TOKEN    = os.environ.get("WORKER_TOKEN", "")
-MAX_DURATION_S  = int(os.environ.get("MAX_DURATION_SEC", "240"))  # hard stop (e.g. 240s = 4 min)
+MAX_DURATION_S  = int(os.environ.get("MAX_DURATION_SEC", "300"))  # e.g. 300 = 5 min
 MAX_BYTES       = int(os.environ.get("MAX_BYTES", "0"))  # optional hard stop by size (0 = ignore)
 
 # yt-dlp politeness/retry tuning to reduce 429s
@@ -124,20 +124,22 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
     if not info or not has_media:
         return _error_payload(rid, vredd, "unavailable_or_removed_preflight")
 
-    # length guard (if duration present)
+    # length hint (if duration present) — do NOT skip here; just mark for trimming
+    need_trim = False
     dur = None
     try:
         if "duration" in info and info["duration"]:
             dur = float(info["duration"])
+            if MAX_DURATION_S > 0 and dur > MAX_DURATION_S:
+                need_trim = True
     except Exception:
         dur = None
 
-    if dur is not None and MAX_DURATION_S > 0 and dur > MAX_DURATION_S:
-        # Skip cleanly with error payload so DB can record it
-        return _error_payload(rid, vredd, f"skipped_long_video: {int(dur)}s > {MAX_DURATION_S}s")
-
     # ---------- download (cap at 720p mp4 like your original) ----------
     out_path = os.path.join(tempfile.gettempdir(), f"{rid}.mp4")
+    trimmed_path = os.path.join(tempfile.gettempdir(), f"{rid}.cut.mp4")
+    out_for_upload = out_path
+
     dl_cmd = [
         "yt-dlp",
         *YTDLP_COMMON,
@@ -153,55 +155,75 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
         # Return error payload so the flow can mark error without exploding
         return _error_payload(rid, vredd, f"yt-dlp_error: {e}")
 
-    # Optional: hard-stop by bytes if configured
     try:
-        file_bytes = os.path.getsize(out_path)
-        if MAX_BYTES > 0 and file_bytes > MAX_BYTES:
-            try: os.remove(out_path)
-            except Exception: pass
-            return _error_payload(rid, vredd, f"skipped_large_file: {file_bytes}B > {MAX_BYTES}B")
-    except Exception:
-        pass
+        # ---------- ALWAYS verify duration after download ----------
+        post_dur = _ffprobe_duration(out_path)
+        if post_dur is not None and MAX_DURATION_S > 0 and post_dur > MAX_DURATION_S:
+            need_trim = True
 
-    # ---------- ALWAYS verify duration after download (trust but verify) ----------
-    post_dur = _ffprobe_duration(out_path)
-    if post_dur is not None and MAX_DURATION_S > 0 and post_dur > MAX_DURATION_S:
-        try: os.remove(out_path)
-        except Exception: pass
-        return _error_payload(rid, vredd, f"skipped_long_video_after_download: {int(post_dur)}s > {MAX_DURATION_S}s")
+        # ---------- Trim locally if needed ----------
+        if need_trim and MAX_DURATION_S > 0:
+            # ffmpeg trim the head to MAX_DURATION_S, copy codecs to be fast
+            trim_cmd = [
+                "ffmpeg", "-y",
+                "-i", out_path,
+                "-t", str(MAX_DURATION_S),
+                "-c", "copy",
+                trimmed_path,
+            ]
+            try:
+                _run(trim_cmd, check=True, capture=False, text=False, timeout=None)
+            except subprocess.CalledProcessError as e:
+                return _error_payload(rid, vredd, f"ffmpeg_trim_error: {e}")
+            # use trimmed file for upload
+            out_for_upload = trimmed_path
 
-    # ---------- unsigned upload to Cloudinary via REST (no SDK) ----------
-    up_url = f"https://api.cloudinary.com/v1_1/{CLD_NAME}/video/upload"
-    public_id = f"reddit/{rid}"
+        # ---------- Optional: hard-stop by bytes if configured (check actual file we will upload) ----------
+        if MAX_BYTES > 0:
+            try:
+                file_bytes = os.path.getsize(out_for_upload)
+                if file_bytes > MAX_BYTES:
+                    return _error_payload(rid, vredd, f"skipped_large_file: {file_bytes}B > {MAX_BYTES}B")
+            except Exception:
+                pass
 
-    try:
-        with open(out_path, "rb") as f:
-            res = requests.post(
-                up_url,
-                data={"upload_preset": CLD_PRESET, "public_id": public_id},
-                files={"file": f},
-                timeout=600
-            )
-    except requests.exceptions.RequestException as e:
-        # network/timeout/etc — return a structured error instead of 500
-        return _error_payload(rid, vredd, f"cloudinary_exception: {type(e).__name__}: {e}")
-    finally:
-        # best effort cleanup
-        try: os.remove(out_path)
-        except Exception: pass
+        # ---------- unsigned upload to Cloudinary via REST (no SDK) ----------
+        up_url = f"https://api.cloudinary.com/v1_1/{CLD_NAME}/video/upload"
+        public_id = f"reddit/{rid}"
 
-    if res.status_code >= 300:
-        # Return enriched error so DB can capture last_error
-        snippet = ""
         try:
-            snippet = res.text[:200]
-        except Exception:
-            pass
-        return _error_payload(rid, vredd, f"cloudinary_error: {res.status_code} {snippet}")
+            with open(out_for_upload, "rb") as f:
+                res = requests.post(
+                    up_url,
+                    data={"upload_preset": CLD_PRESET, "public_id": public_id},
+                    files={"file": f},
+                    timeout=600
+                )
+        except requests.exceptions.RequestException as e:
+            # network/timeout/etc — return a structured error instead of 500
+            return _error_payload(rid, vredd, f"cloudinary_exception: {type(e).__name__}: {e}")
 
-    j = res.json()
-    public_id  = j.get("public_id")
-    secure_url = j.get("secure_url")
-    thumb_url  = f"https://res.cloudinary.com/{CLD_NAME}/video/upload/so_2,w_640,h_360,c_fill,q_auto,f_auto/{public_id}.jpg" if public_id else None
+        if res.status_code >= 300:
+            # Return enriched error so DB can capture last_error
+            snippet = ""
+            try:
+                snippet = res.text[:200]
+            except Exception:
+                pass
+            return _error_payload(rid, vredd, f"cloudinary_error: {res.status_code} {snippet}")
 
-    return _stable_response(rid, vredd, public_id=public_id, secure_url=secure_url, thumb_url=thumb_url)
+        j = res.json()
+        public_id  = j.get("public_id")
+        secure_url = j.get("secure_url")
+        thumb_url  = f"https://res.cloudinary.com/{CLD_NAME}/video/upload/so_2,w_640,h_360,c_fill,q_auto,f_auto/{public_id}.jpg" if public_id else None
+
+        return _stable_response(rid, vredd, public_id=public_id, secure_url=secure_url, thumb_url=thumb_url)
+
+    finally:
+        # best effort cleanup for both files
+        for pth in (out_path, trimmed_path):
+            try:
+                if os.path.exists(pth):
+                    os.remove(pth)
+            except Exception:
+                pass
