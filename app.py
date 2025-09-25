@@ -48,13 +48,13 @@ def _run(cmd: list[str], check=True, capture=False, text=False, timeout=None):
 def _preflight_info(url: str, retries: int = 1, backoff_base: float = 1.0) -> dict:
     """
     Use yt-dlp to fetch metadata only (no download). Returns {} on failure.
-    (Quick check: 1 try, short timeout)
+    Tolerates preflight timeouts to avoid returning HTTP 500.
     """
     for attempt in range(1, retries + 1):
         try:
             cmd = ["yt-dlp", *YTDLP_COMMON, "-j", "--skip-download", url]
-            # short timeout for preflight
-            p = _run(cmd, check=True, capture=True, text=True, timeout=10)
+            # slightly longer to avoid spurious timeouts under load/rate-limit
+            p = _run(cmd, check=True, capture=True, text=True, timeout=25)
             # yt-dlp may print multiple lines; take the first valid JSON line
             for line in p.stdout.splitlines():
                 line = line.strip()
@@ -64,7 +64,7 @@ def _preflight_info(url: str, retries: int = 1, backoff_base: float = 1.0) -> di
                     return json.loads(line)
                 except json.JSONDecodeError:
                     continue
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             pass
         # backoff (won't run if retries==1)
         time.sleep(backoff_base * attempt)
