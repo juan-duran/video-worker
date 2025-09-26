@@ -100,23 +100,30 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
     if WORKER_TOKEN and x_token != WORKER_TOKEN:
         raise HTTPException(status_code=401, detail="invalid token")
 
+    # ---------- LOCK IN IDENTIFIERS (only this fix) ----------
+    # Canonical ID for DB upsert must be exactly the provided thread_id (or legacy reddit_id).
+    thread_id_raw = payload.get("thread_id")
+    legacy_id_raw = payload.get("reddit_id")  # legacy back-compat
+
+    if isinstance(thread_id_raw, str) and thread_id_raw.strip():
+        thread_id = thread_id_raw.strip()
+    elif isinstance(legacy_id_raw, str) and legacy_id_raw.strip():
+        thread_id = legacy_id_raw.strip()
+    else:
+        # Do not fabricate a UUID for thread_id; fail fast so upstream upsert logic is safe.
+        raise HTTPException(status_code=400, detail="thread_id ausente")
+
+    # Source URL priority: video_url_clean -> video_url -> vredd_url (legacy)
+    source_url = (payload.get("video_url_clean")
+                  or payload.get("video_url")
+                  or payload.get("vredd_url")
+                  or "").strip()
+
+    if not source_url.startswith("https://v.redd.it/"):
+        raise HTTPException(status_code=400, detail="vredd_url inválida")
+
     # Wrap the whole flow defensively so nothing ever leaks a 500
     try:
-        # Accept new field names, stay backward compatible
-        # Canonical ID for DB upsert = thread_id
-        thread_id = (payload.get("thread_id")
-                     or payload.get("reddit_id")  # legacy
-                     or str(uuid.uuid4())).strip()
-
-        # Source URL priority: video_url_clean -> video_url -> vredd_url (legacy)
-        source_url = (payload.get("video_url_clean")
-                      or payload.get("video_url")
-                      or payload.get("vredd_url")
-                      or "").strip()
-
-        if not source_url.startswith("https://v.redd.it/"):
-            raise HTTPException(status_code=400, detail="vredd_url inválida")
-
         # ---------- preflight: quick check & skip if no media ----------
         info = _preflight_info(source_url)
         has_media = bool(info.get("duration") or info.get("formats") or info.get("url"))
@@ -230,6 +237,5 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
         raise
     except Exception as e:
         # last-ditch guard: never emit a 500 up to n8n; return structured error
-        thread_id = (payload.get("thread_id") or payload.get("reddit_id") or str(uuid.uuid4())).strip()
-        source_url = (payload.get("video_url_clean") or payload.get("video_url") or payload.get("vredd_url") or "").strip()
+        # IMPORTANT: reuse the same thread_id and source_url we already locked in (no UUID fallback)
         return _one_response(thread_id, source_url, error_message=f"unexpected_exception: {type(e).__name__}: {e}")
