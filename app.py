@@ -85,7 +85,7 @@ def _short_id(n=12):
     return ''.join(random.choice(alpha) for _ in range(n))
 
 def _stable_response(thread_id: str, source_url: str, public_id=None, secure_url=None, thumb_url=None):
-    # NOTE: ONLY thread_id is returned (no reddit_id).
+    # Only thread_id is returned (no reddit_id), and thread_id is exactly what caller sent.
     return {
         "thread_id": thread_id,
         "source_url": source_url,
@@ -108,12 +108,14 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
         raise HTTPException(status_code=401, detail="invalid token")
 
     try:
-        # Preserve EXACT thread_id provided by caller (no substitution)
-        thread_id = (payload.get("thread_id") or "").strip()
-        if not thread_id:
-            thread_id = str(uuid.uuid4())  # fallback only if caller didn't provide one
+        # NEVER overwrite the provided id. Accept thread_id (new) or reddit_id (legacy).
+        raw_id = (payload.get("thread_id") or payload.get("reddit_id") or "").strip()
+        if not raw_id:
+            raise HTTPException(status_code=400, detail="thread_id required")
 
-        # Accept legacy input names for the URL too (unchanged logic)
+        thread_id = raw_id  # keep EXACT value
+
+        # Accept legacy url keys too
         vredd = (payload.get("video_url_clean") or payload.get("vredd_url") or payload.get("video_url") or "").strip()
         if not vredd.startswith("https://v.redd.it/"):
             raise HTTPException(status_code=400, detail="vredd_url inválida")
@@ -132,7 +134,7 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
         except Exception:
             pass
 
-        # Use a short random temp id for filenames (does NOT expose thread_id)
+        # Use a short random temp id for local filenames (does NOT expose thread_id)
         temp_id = _short_id(12)
         out_path       = os.path.join(tempfile.gettempdir(), f"{temp_id}.mp4")
         trimmed_path   = os.path.join(tempfile.gettempdir(), f"{temp_id}.cut.mp4")
@@ -224,5 +226,6 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
         raise
     except Exception as e:
         vredd = (payload.get("video_url_clean") or payload.get("vredd_url") or payload.get("video_url") or "").strip()
-        thread_id = (payload.get("thread_id") or "").strip() or str(uuid.uuid4())
-        return _error_payload(thread_id, vredd, f"unexpected_exception: {type(e).__name__}: {e}")
+        # do NOT invent an id here either; echo what we got (or empty) for debugging
+        thread_id = (payload.get("thread_id") or payload.get("reddit_id") or "").strip()
+        return _error_payload(thread_id or "<missing>", vredd, f"unexpected_exception: {type(e).__name__}: {e}")
