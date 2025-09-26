@@ -110,11 +110,10 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
 
     # Wrap the whole flow defensively so nothing ever leaks a 500
     try:
-        # Use the EXACT incoming thread_id value (do not generate/override)
-        thread_id = (payload.get("thread_id") or "").strip()
-        if not thread_id:
-            raise HTTPException(status_code=400, detail="thread_id is required")
+        # Preserve EXACT incoming thread_id; never override or generate for output
+        thread_id = (payload.get("thread_id") or payload.get("reddit_id") or "").strip()
 
+        # Accept any of these for source URL; strip to remove stray tabs/newlines
         vredd = (payload.get("video_url_clean") or payload.get("vredd_url") or payload.get("video_url") or "").strip()
         if not vredd.startswith("https://v.redd.it/"):
             raise HTTPException(status_code=400, detail="vredd_url inválida")
@@ -127,19 +126,18 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
 
         # length hint (if present) — we’ll trim after download if needed
         need_trim = False
-        dur = None
         try:
             if "duration" in info and info["duration"]:
-                dur = float(info["duration"])
-                if MAX_DURATION_S > 0 and dur > MAX_DURATION_S:
+                if MAX_DURATION_S > 0 and float(info["duration"]) > MAX_DURATION_S:
                     need_trim = True
         except Exception:
-            dur = None
+            pass
 
         # ---------- download (720p mp4 like original) ----------
-        # temp filenames can use thread_id safely; these are local only
-        out_path      = os.path.join(tempfile.gettempdir(), f"{thread_id}.mp4")
-        trimmed_path  = os.path.join(tempfile.gettempdir(), f"{thread_id}.cut.mp4")
+        # Local temp filenames (safe to use a generated id if thread_id is empty)
+        local_id = thread_id or str(uuid.uuid4())
+        out_path       = os.path.join(tempfile.gettempdir(), f"{local_id}.mp4")
+        trimmed_path   = os.path.join(tempfile.gettempdir(), f"{local_id}.cut.mp4")
         out_for_upload = out_path
 
         dl_cmd = [
@@ -156,12 +154,10 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
             return _error_payload(thread_id, vredd, f"yt-dlp_error: {e}")
 
         try:
-            # verify duration post-download; mark for trim if needed
             post_dur = _ffprobe_duration(out_path)
             if post_dur is not None and MAX_DURATION_S > 0 and post_dur > MAX_DURATION_S:
                 need_trim = True
 
-            # Trim locally if needed (stream copy; cut point may align to keyframe)
             if need_trim and MAX_DURATION_S > 0:
                 trim_cmd = [
                     "ffmpeg", "-y",
@@ -176,7 +172,6 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
                     return _error_payload(thread_id, vredd, f"ffmpeg_trim_error: {e}")
                 out_for_upload = trimmed_path
 
-            # optional size guard (on the file we’ll upload)
             if MAX_BYTES > 0:
                 try:
                     file_bytes = os.path.getsize(out_for_upload)
@@ -187,11 +182,10 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
 
             # ---------- unsigned upload to Cloudinary via REST ----------
             up_url = f"https://api.cloudinary.com/v1_1/{CLD_NAME}/video/upload"
-            public_id = _short_id(12)  # short random name (no 'reddit/', no thread_id leakage)
+            public_id = _short_id(12)  # no 'reddit/', no thread_id leakage
 
             try:
                 with open(out_for_upload, "rb") as f:
-                    # split timeouts: (connect, read) for robustness
                     res = requests.post(
                         up_url,
                         data={"upload_preset": CLD_PRESET, "public_id": public_id},
@@ -229,10 +223,9 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
                     pass
 
     except HTTPException:
-        # preserve intentional HTTP errors (e.g., bad token, bad vredd)
         raise
     except Exception as e:
-        # last-ditch guard: never emit a 500 up to n8n; return structured error
-        thread_id = (payload.get("thread_id") or "").strip()
+        # structured error; keep whatever thread_id was sent (or empty)
+        thread_id = (payload.get("thread_id") or payload.get("reddit_id") or "").strip()
         vredd = (payload.get("video_url_clean") or payload.get("vredd_url") or payload.get("video_url") or "").strip()
-        return _error_payload(thread_id or "unknown", vredd, f"unexpected_exception: {type(e).__name__}: {e}")
+        return _error_payload(thread_id, vredd, f"unexpected_exception: {type(e).__name__}: {e}")
