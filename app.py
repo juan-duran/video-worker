@@ -161,7 +161,7 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
                 except Exception:
                     pass
 
-            # ⬇️ Removed the "reddit/" folder — just use the thread_id
+            # Use thread_id directly (no 'reddit/' prefix)
             up_url    = f"https://api.cloudinary.com/v1_1/{CLD_NAME}/video/upload"
             public_id = tid
 
