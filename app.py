@@ -1,4 +1,4 @@
-import os, tempfile, subprocess, uuid, json, time, requests, random, string
+import os, tempfile, subprocess, uuid, json, time, requests
 from fastapi import FastAPI, Body, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 
@@ -17,7 +17,7 @@ YTDLP_COMMON = [
     "--retry-sleep", "linear=1:10",
     "--sleep-requests", "1",
     "--concurrent-fragments", "1",
-    "--socket-timeout", "20",                 # explicit socket timeout
+    "--socket-timeout", "20",
     "--user-agent", "Mozilla/5.0 (compatible; IDBVideoWorker/1.0)",
 ]
 
@@ -47,7 +47,9 @@ def _run(cmd: list[str], check=True, capture=False, text=False, timeout=None):
     )
 
 def _preflight_info(url: str, retries: int = 1, backoff_base: float = 1.0) -> dict:
-    """Use yt-dlp to fetch metadata only (no download). Returns {} on failure/timeout."""
+    """
+    Use yt-dlp to fetch metadata only (no download). Returns {} on failure/timeout.
+    """
     for attempt in range(1, retries + 1):
         try:
             cmd = ["yt-dlp", *YTDLP_COMMON, "-j", "--skip-download", url]
@@ -78,25 +80,18 @@ def _ffprobe_duration(path: str) -> float | None:
     except Exception:
         return None
 
-def _short_id(n=12):
-    alpha = "abcdefghijklmnopqrstuvwxyz0123456789"
-    return "".join(random.choice(alpha) for _ in range(n))
-
-def _stable_response(thread_id: str, source_url: str, public_id=None, secure_url=None, thumb_url=None):
-    # EXACT output keys you asked for (no reddit_id key at all)
-    return {
+# ---- Response builders (new shape + array-of-one) ----
+def _one_response(thread_id: str, source_url: str, public_id=None, secure_url=None, thumb_url=None, error_message: str | None = None):
+    obj = {
         "thread_id": thread_id,
         "source_url": source_url,
         "public_id": public_id,
         "secure_url": secure_url,
-        "thumb_url":  thumb_url,
+        "thumb_url": thumb_url,
     }
-
-def _error_payload(thread_id: str, source_url: str, message: str):
-    base = _stable_response(thread_id, source_url, None, None, None)
-    base["video_url_clean"] = source_url
-    base["error"] = {"message": message}
-    return base
+    if error_message:
+        obj["error"] = {"message": error_message}
+    return [obj]
 
 # ---------- main endpoint ----------
 @app.post("/mux-upload")
@@ -105,32 +100,41 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
     if WORKER_TOKEN and x_token != WORKER_TOKEN:
         raise HTTPException(status_code=401, detail="invalid token")
 
+    # Wrap the whole flow defensively so nothing ever leaks a 500
     try:
-        # STRICT: use exactly the incoming thread_id; do not invent/override
-        thread_id = (payload.get("thread_id") or "").strip()
-        if not thread_id:
-            raise HTTPException(status_code=400, detail="thread_id is required")
+        # Accept new field names, stay backward compatible
+        # Canonical ID for DB upsert = thread_id
+        thread_id = (payload.get("thread_id")
+                     or payload.get("reddit_id")  # legacy
+                     or str(uuid.uuid4())).strip()
 
-        # Accept any of these for source URL (keeps existing callers working)
-        vredd = (payload.get("video_url_clean") or payload.get("vredd_url") or payload.get("video_url") or "").strip()
-        if not vredd.startswith("https://v.redd.it/"):
+        # Source URL priority: video_url_clean -> video_url -> vredd_url (legacy)
+        source_url = (payload.get("video_url_clean")
+                      or payload.get("video_url")
+                      or payload.get("vredd_url")
+                      or "").strip()
+
+        if not source_url.startswith("https://v.redd.it/"):
             raise HTTPException(status_code=400, detail="vredd_url inválida")
 
-        # ---------- preflight ----------
-        info = _preflight_info(vredd)
+        # ---------- preflight: quick check & skip if no media ----------
+        info = _preflight_info(source_url)
         has_media = bool(info.get("duration") or info.get("formats") or info.get("url"))
         if not info or not has_media:
-            return _error_payload(thread_id, vredd, "unavailable_or_removed_preflight")
+            return _one_response(thread_id, source_url, error_message="unavailable_or_removed_preflight")
 
+        # length hint (if present) — we’ll trim after download if needed
         need_trim = False
         try:
-            if info.get("duration"):
-                if MAX_DURATION_S > 0 and float(info["duration"]) > MAX_DURATION_S:
+            if "duration" in info and info["duration"]:
+                dur = float(info["duration"])
+                if MAX_DURATION_S > 0 and dur > MAX_DURATION_S:
                     need_trim = True
         except Exception:
             pass
 
         # ---------- download (720p mp4 like original) ----------
+        # Use thread_id for temp files only (not exposed), safe to keep
         out_path       = os.path.join(tempfile.gettempdir(), f"{thread_id}.mp4")
         trimmed_path   = os.path.join(tempfile.gettempdir(), f"{thread_id}.cut.mp4")
         out_for_upload = out_path
@@ -141,18 +145,20 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
             "--merge-output-format", "mp4",
             "-S", "res:720,ext:mp4",
             "-o", out_path,
-            vredd,
+            source_url,
         ]
         try:
             _run(dl_cmd, check=True)
         except subprocess.CalledProcessError as e:
-            return _error_payload(thread_id, vredd, f"yt-dlp_error: {e}")
+            return _one_response(thread_id, source_url, error_message=f"yt-dlp_error: {e}")
 
         try:
+            # verify duration post-download; mark for trim if needed
             post_dur = _ffprobe_duration(out_path)
             if post_dur is not None and MAX_DURATION_S > 0 and post_dur > MAX_DURATION_S:
                 need_trim = True
 
+            # Trim locally if needed (stream copy; cut point may align to keyframe)
             if need_trim and MAX_DURATION_S > 0:
                 trim_cmd = [
                     "ffmpeg", "-y",
@@ -164,31 +170,33 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
                 try:
                     _run(trim_cmd, check=True, capture=False, text=False, timeout=None)
                 except subprocess.CalledProcessError as e:
-                    return _error_payload(thread_id, vredd, f"ffmpeg_trim_error: {e}")
+                    return _one_response(thread_id, source_url, error_message=f"ffmpeg_trim_error: {e}")
                 out_for_upload = trimmed_path
 
+            # optional size guard (on the file we’ll upload)
             if MAX_BYTES > 0:
                 try:
                     file_bytes = os.path.getsize(out_for_upload)
                     if file_bytes > MAX_BYTES:
-                        return _error_payload(thread_id, vredd, f"skipped_large_file: {file_bytes}B > {MAX_BYTES}B")
+                        return _one_response(thread_id, source_url, error_message=f"skipped_large_file: {file_bytes}B > {MAX_BYTES}B")
                 except Exception:
                     pass
 
-            # ---------- Cloudinary unsigned upload ----------
-            up_url    = f"https://api.cloudinary.com/v1_1/{CLD_NAME}/video/upload"
-            public_id = _short_id(12)  # short random name (no 'reddit/', no thread_id leakage)
+            # ---------- unsigned upload to Cloudinary via REST ----------
+            up_url = f"https://api.cloudinary.com/v1_1/{CLD_NAME}/video/upload"
+            # short random public_id (no "reddit" anywhere)
+            public_id_random = uuid.uuid4().hex[:10]  # short, hard to reverse to thread_id
 
             try:
                 with open(out_for_upload, "rb") as f:
                     res = requests.post(
                         up_url,
-                        data={"upload_preset": CLD_PRESET, "public_id": public_id},
+                        data={"upload_preset": CLD_PRESET, "public_id": public_id_random},
                         files={"file": f},
                         timeout=(15, 600),
                     )
             except requests.exceptions.RequestException as e:
-                return _error_payload(thread_id, vredd, f"cloudinary_exception: {type(e).__name__}: {e}")
+                return _one_response(thread_id, source_url, error_message=f"cloudinary_exception: {type(e).__name__}: {e}")
 
             if res.status_code >= 300:
                 snippet = ""
@@ -196,19 +204,20 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
                     snippet = res.text[:200]
                 except Exception:
                     pass
-                return _error_payload(thread_id, vredd, f"cloudinary_error: {res.status_code} {snippet}")
+                return _one_response(thread_id, source_url, error_message=f"cloudinary_error: {res.status_code} {snippet}")
 
             j = res.json()
-            public_id  = j.get("public_id")
+            public_id  = j.get("public_id")  # should be public_id_random
             secure_url = j.get("secure_url")
             thumb_url  = (
                 f"https://res.cloudinary.com/{CLD_NAME}/video/upload/so_2,w_640,h_360,c_fill,q_auto,f_auto/{public_id}.jpg"
                 if public_id else None
             )
 
-            return _stable_response(thread_id, vredd, public_id=public_id, secure_url=secure_url, thumb_url=thumb_url)
+            return _one_response(thread_id, source_url, public_id=public_id, secure_url=secure_url, thumb_url=thumb_url)
 
         finally:
+            # best effort cleanup for both files
             for pth in (out_path, trimmed_path):
                 try:
                     if os.path.exists(pth):
@@ -217,9 +226,10 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
                     pass
 
     except HTTPException:
+        # preserve intentional HTTP errors (e.g., bad token, bad vredd)
         raise
     except Exception as e:
-        # keep thread_id exactly as provided, even on errors
-        thread_id = (payload.get("thread_id") or "").strip()
-        vredd = (payload.get("video_url_clean") or payload.get("vredd_url") or payload.get("video_url") or "").strip()
-        return _error_payload(thread_id or "unknown", vredd, f"unexpected_exception: {type(e).__name__}: {e}")
+        # last-ditch guard: never emit a 500 up to n8n; return structured error
+        thread_id = (payload.get("thread_id") or payload.get("reddit_id") or str(uuid.uuid4())).strip()
+        source_url = (payload.get("video_url_clean") or payload.get("video_url") or payload.get("vredd_url") or "").strip()
+        return _one_response(thread_id, source_url, error_message=f"unexpected_exception: {type(e).__name__}: {e}")
