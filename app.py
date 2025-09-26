@@ -95,7 +95,7 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
     # Wrap the whole flow defensively so nothing ever leaks a 500
     try:
         # 1) Preserve caller's thread_id EXACTLY; fall back to legacy reddit_id; else UUID
-        rid = (payload.get("thread_id") or payload.get("reddit_id") or str(uuid.uuid4())).strip()
+        rid = (payload.get("thread_id")
 
         # accept modern names too (video_url_clean/video_url)
         vredd = (payload.get("vredd_url") or payload.get("video_url_clean") or payload.get("video_url") or "").strip()
