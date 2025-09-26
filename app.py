@@ -177,8 +177,7 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
 
             # ---------- unsigned upload to Cloudinary via REST ----------
             up_url = f"https://api.cloudinary.com/v1_1/{CLD_NAME}/video/upload"
-            # CHANGED: drop "reddit/" — keep the same id value, just no folder prefix
-            public_id = rid  # <— only change
+            public_id = rid  # ← ONLY CHANGE (no 'reddit/' folder)
 
             try:
                 with open(out_for_upload, "rb") as f:
