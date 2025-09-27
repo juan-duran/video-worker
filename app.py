@@ -1,4 +1,4 @@
-import os, tempfile, subprocess, json, time, requests, secrets, string
+import os, tempfile, subprocess, uuid, json, time, requests, secrets, string
 from fastapi import FastAPI, Body, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 
@@ -53,7 +53,6 @@ def _preflight_info(url: str, retries: int = 1, backoff_base: float = 1.0) -> di
     for attempt in range(1, retries + 1):
         try:
             cmd = ["yt-dlp", *YTDLP_COMMON, "-j", "--skip-download", url]
-            # allow a bit more than the socket-timeout to avoid spurious timeouts
             p = _run(cmd, check=True, capture=True, text=True, timeout=25)
             for line in p.stdout.splitlines():
                 line = line.strip()
@@ -95,61 +94,56 @@ def _stable_response(thread_id: str, source_url: str, public_id=None, secure_url
         "thumb_url":  thumb_url,
     }
 
-def _error_payload(thread_id: str, source_url: str, message: str):
+def _error_dict(thread_id: str, source_url: str, message: str):
     base = _stable_response(thread_id, source_url, None, None, None)
     base["error"] = {"message": message}
     return base
 
-def _normalize_one(item: dict):
+def _normalize_item(raw: dict):
     """
-    Normalize one payload item into (thread_id, source_url).
-    - thread_id: MUST be provided by caller; never replaced/rewritten.
-    - source_url: prefer video_url_clean > video_url > vredd_url; always stripped.
+    Returns (thread_id, source_url) with strict preservation of thread_id.
+    - thread_id MUST come from input; never generated, never rewritten.
+    - source_url is taken from video_url_clean > video_url > vredd_url and stripped.
     """
-    raw_tid = item.get("thread_id")
-    if raw_tid is None:
-        return None, (item.get("video_url_clean") or item.get("video_url") or item.get("vredd_url") or "")
-    thread_id = str(raw_tid).strip()
-    source_url = (item.get("video_url_clean") or item.get("video_url") or item.get("vredd_url") or "")
+    raw_tid = raw.get("thread_id")
+    # Accept ints/str; coerce to str then strip whitespace (including tabs/newlines)
+    thread_id = (str(raw_tid).strip()) if raw_tid is not None else ""
+    source_url = (raw.get("video_url_clean") or raw.get("video_url") or raw.get("vredd_url") or "")
     source_url = (source_url or "").strip()
     return thread_id, source_url
 
-def _process_one(item: dict):
+def _process_one(raw: dict):
     """
-    Process a single item end-to-end and return a single response dict.
+    Process one item end-to-end. Always returns a dict (success or error).
     """
-    thread_id, source_url = _normalize_one(item)
+    thread_id, source_url = _normalize_item(raw)
 
-    # Enforce presence of thread_id exactly as provided (no fallback)
     if not thread_id:
-        # Strip source_url for clean output even on error
-        return _error_payload("", (source_url or "").strip(), "missing_thread_id")
+        return _error_dict("", source_url, "missing_thread_id")
 
-    # Validate source URL (must be v.redd.it)
-    if not (source_url or "").startswith("https://v.redd.it/"):
-        # preserve original error contract text from legacy code
-        raise HTTPException(status_code=400, detail="vredd_url inválida")
+    if not source_url.startswith("https://v.redd.it/"):
+        # keep legacy error text
+        return _error_dict(thread_id, source_url, "vredd_url inválida")
 
     try:
-        # ---------- preflight: quick check & skip if no media ----------
+        # ---------- preflight ----------
         info = _preflight_info(source_url)
         has_media = bool(info.get("duration") or info.get("formats") or info.get("url"))
         if not info or not has_media:
-            return _error_payload(thread_id, source_url, "unavailable_or_removed_preflight")
+            return _error_dict(thread_id, source_url, "unavailable_or_removed_preflight")
 
-        # length hint (if present) — we’ll trim after download if needed
+        # duration hint
         need_trim = False
         try:
-            if "duration" in info and info["duration"]:
+            if info.get("duration"):
                 dur = float(info["duration"])
                 if MAX_DURATION_S > 0 and dur > MAX_DURATION_S:
                     need_trim = True
         except Exception:
             pass
 
-        # ---------- download (720p mp4 like original) ----------
-        # Use a short random local filename (NEVER include thread_id; avoid any "reddit" wording)
-        tmp_base      = _short_id(10)
+        # ---------- download ----------
+        tmp_base      = _short_id(10)  # avoid leaking thread_id; keep names short
         out_path      = os.path.join(tempfile.gettempdir(), f"{tmp_base}.mp4")
         trimmed_path  = os.path.join(tempfile.gettempdir(), f"{tmp_base}.cut.mp4")
         out_for_upload = out_path
@@ -165,15 +159,14 @@ def _process_one(item: dict):
         try:
             _run(dl_cmd, check=True)
         except subprocess.CalledProcessError as e:
-            return _error_payload(thread_id, source_url, f"yt-dlp_error: {e}")
+            return _error_dict(thread_id, source_url, f"yt-dlp_error: {e}")
 
         try:
-            # verify duration post-download; mark for trim if needed
+            # verify duration and trim if needed
             post_dur = _ffprobe_duration(out_path)
             if post_dur is not None and MAX_DURATION_S > 0 and post_dur > MAX_DURATION_S:
                 need_trim = True
 
-            # Trim locally if needed (stream copy; cut point may align to keyframe)
             if need_trim and MAX_DURATION_S > 0:
                 trim_cmd = [
                     "ffmpeg", "-y",
@@ -185,26 +178,24 @@ def _process_one(item: dict):
                 try:
                     _run(trim_cmd, check=True, capture=False, text=False, timeout=None)
                 except subprocess.CalledProcessError as e:
-                    return _error_payload(thread_id, source_url, f"ffmpeg_trim_error: {e}")
+                    return _error_dict(thread_id, source_url, f"ffmpeg_trim_error: {e}")
                 out_for_upload = trimmed_path
 
-            # optional size guard (on the file we’ll upload)
+            # optional size guard
             if MAX_BYTES > 0:
                 try:
                     file_bytes = os.path.getsize(out_for_upload)
                     if file_bytes > MAX_BYTES:
-                        return _error_payload(thread_id, source_url, f"skipped_large_file: {file_bytes}B > {MAX_BYTES}B")
+                        return _error_dict(thread_id, source_url, f"skipped_large_file: {file_bytes}B > {MAX_BYTES}B")
                 except Exception:
                     pass
 
-            # ---------- unsigned upload to Cloudinary via REST ----------
+            # ---------- upload ----------
             up_url = f"https://api.cloudinary.com/v1_1/{CLD_NAME}/video/upload"
-            # Short random public_id; do NOT expose "reddit" or the thread_id
-            public_id_req = _short_id(12)
+            public_id_req = _short_id(12)  # no "reddit", no thread_id
 
             try:
                 with open(out_for_upload, "rb") as f:
-                    # split timeouts: (connect, read) for robustness
                     res = requests.post(
                         up_url,
                         data={"upload_preset": CLD_PRESET, "public_id": public_id_req},
@@ -212,7 +203,7 @@ def _process_one(item: dict):
                         timeout=(15, 600),
                     )
             except requests.exceptions.RequestException as e:
-                return _error_payload(thread_id, source_url, f"cloudinary_exception: {type(e).__name__}: {e}")
+                return _error_dict(thread_id, source_url, f"cloudinary_exception: {type(e).__name__}: {e}")
 
             if res.status_code >= 300:
                 snippet = ""
@@ -220,8 +211,9 @@ def _process_one(item: dict):
                     snippet = res.text[:200]
                 except Exception:
                     pass
-                return _error_payload(thread_id, source_url, f"cloudinary_error: {res.status_code} {snippet}")
+                return _error_dict(thread_id, source_url, f"cloudinary_error: {res.status_code} {snippet}")
 
+            # parse response
             j = res.json()
             public_id  = j.get("public_id") or public_id_req
             secure_url = j.get("secure_url")
@@ -230,11 +222,10 @@ def _process_one(item: dict):
                 if public_id else None
             )
 
-            # Return a single dict per item; thread_id is EXACTLY the input value
             return _stable_response(thread_id, source_url, public_id=public_id, secure_url=secure_url, thumb_url=thumb_url)
 
         finally:
-            # best effort cleanup for both files
+            # cleanup
             for pth in (out_path, trimmed_path):
                 try:
                     if os.path.exists(pth):
@@ -242,35 +233,30 @@ def _process_one(item: dict):
                 except Exception:
                     pass
 
-    except HTTPException:
-        # preserve intentional HTTP errors (e.g., bad token, bad URL)
-        raise
     except Exception as e:
-        # never emit a 500; preserve the exact input thread_id
-        return _error_payload(thread_id, source_url, f"unexpected_exception: {type(e).__name__}: {e}")
+        return _error_dict(thread_id, source_url, f"unexpected_exception: {type(e).__name__}: {e}")
 
-# ---------- main endpoint (supports single dict or list of dicts) ----------
+# ---------- main endpoint (accept dict OR list) ----------
 @app.post("/mux-upload")
-def mux_upload_entry(payload=Body(...), x_token: str = Header(default="")):
+def mux_upload(payload = Body(...), x_token: str = Header(default="")):
     # Auth
     if WORKER_TOKEN and x_token != WORKER_TOKEN:
         raise HTTPException(status_code=401, detail="invalid token")
 
-    # Accept either a single dict or a list of dicts from upstream (e.g., n8n)
-    items = []
+    # Normalize to list of dicts
     if isinstance(payload, list):
         items = payload
     elif isinstance(payload, dict):
         items = [payload]
     else:
-        # unsupported shape
         raise HTTPException(status_code=400, detail="invalid_payload_shape")
 
     results = []
     for it in items:
         if not isinstance(it, dict):
-            results.append(_error_payload("", "", "invalid_item_shape"))
+            results.append(_error_dict("", "", "invalid_item_shape"))
             continue
         results.append(_process_one(it))
 
+    # Always return a list (one dict per input item)
     return results
