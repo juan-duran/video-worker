@@ -82,6 +82,7 @@ def _ffprobe_duration(path: str) -> float | None:
         return None
 
 def _stable_response(thread_id: str, source_url: str, public_id=None, secure_url=None, thumb_url=None):
+    # NOTE: return shape is wrapped by the caller into a single-element list
     return {
         "thread_id": thread_id,
         "source_url": source_url,
@@ -94,7 +95,7 @@ def _error_payload(thread_id: str, source_url: str, message: str):
     base = _stable_response(thread_id, source_url, None, None, None)
     base["video_url_clean"] = source_url
     base["error"] = {"message": message}
-    return base
+    return [base]  # <<— array envelope on errors
 
 # ---------- main endpoint ----------
 @app.post("/mux-upload")
@@ -118,18 +119,17 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
 
         # length hint (if present) — we’ll trim after download if needed
         need_trim = False
-        dur = None
         try:
             if "duration" in info and info["duration"]:
                 dur = float(info["duration"])
                 if MAX_DURATION_S > 0 and dur > MAX_DURATION_S:
                     need_trim = True
         except Exception:
-            dur = None
+            pass
 
         # ---------- download (720p mp4 like original) ----------
-        out_path      = os.path.join(tempfile.gettempdir(), f"{tid}.mp4")
-        trimmed_path  = os.path.join(tempfile.gettempdir(), f"{tid}.cut.mp4")
+        out_path       = os.path.join(tempfile.gettempdir(), f"{tid}.mp4")
+        trimmed_path   = os.path.join(tempfile.gettempdir(), f"{tid}.cut.mp4")
         out_for_upload = out_path
 
         dl_cmd = [
@@ -177,8 +177,8 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
 
             # ---------- unsigned upload to Cloudinary via REST ----------
             up_url = f"https://api.cloudinary.com/v1_1/{CLD_NAME}/video/upload"
-            # CHANGE #2 and #3: no "reddit" in path AND do not use thread_id as filename
-            public_id = uuid.uuid4().hex[:12]  # short, non-reversible name
+            # No "reddit" in the path and not reversible from thread_id
+            public_id = uuid.uuid4().hex[:12]
 
             try:
                 with open(out_for_upload, "rb") as f:
@@ -201,14 +201,15 @@ def mux_upload(payload: dict = Body(...), x_token: str = Header(default="")):
                 return _error_payload(tid, vredd, f"cloudinary_error: {res.status_code} {snippet}")
 
             j = res.json()
-            public_id  = j.get("public_id")
-            secure_url = j.get("secure_url")
-            thumb_url  = (
-                f"https://res.cloudinary.com/{CLD_NAME}/video/upload/so_2,w_640,h_360,c_fill,q_auto,f_auto/{public_id}.jpg"
-                if public_id else None
+            public_id_resp  = j.get("public_id")
+            secure_url      = j.get("secure_url")
+            thumb_url       = (
+                f"https://res.cloudinary.com/{CLD_NAME}/video/upload/so_2,w_640,h_360,c_fill,q_auto,f_auto/{public_id_resp}.jpg"
+                if public_id_resp else None
             )
 
-            return _stable_response(tid, vredd, public_id=public_id, secure_url=secure_url, thumb_url=thumb_url)
+            # Wrap success in a single-element array (per your required shape)
+            return [_stable_response(tid, vredd, public_id=public_id_resp, secure_url=secure_url, thumb_url=thumb_url)]
 
         finally:
             # best effort cleanup for both files
